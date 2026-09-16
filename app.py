@@ -1147,7 +1147,7 @@ def render_find_car():
 
 
 def render_predict_price():
-    st.markdown('<div class="eyebrow">Prediction</div><div class="page-title">Estimate a used-car price.</div><div class="page-copy">Pilih spesifikasi kendaraan dalam satu panel kriteria, dengan semua variabel input sudah tersedia tanpa perlu menambah filter secara manual.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="eyebrow">Prediction</div><div class="page-title">Estimate a used-car price.</div><div class="page-copy">Atur seluruh spesifikasi kendaraan langsung seperti panel <b>Your criteria</b> pada Find a Car. Semua variabel model tersedia di sini, termasuk Pajak Tahunan dan Bobot Kendaraan.</div>', unsafe_allow_html=True)
     st.markdown('<div class="rule"></div>', unsafe_allow_html=True)
 
     pred_model_options = sorted([x for x in df_raw["Model"].dropna().map(simplify_model_name).unique().tolist() if x]) if "Model" in df_raw.columns else []
@@ -1156,10 +1156,8 @@ def render_predict_price():
         help="Pilih tipe Toyota Corolla sebagai konteks kendaraan. Model tidak digunakan sebagai predictor regresi."
     ) if pred_model_options else None
 
-    # Same visual language as Find a Car's "Your criteria", but all criteria
-    # are pre-populated for prediction and there are no Add/Hapus controls.
     st.markdown('<div class="card prediction-criteria-card">', unsafe_allow_html=True)
-    section_head("Your criteria", "Atur seluruh spesifikasi yang digunakan untuk estimasi harga")
+    section_head("Your criteria", "Atur nilai setiap variabel sesuai kendaraan yang ingin diprediksi")
 
     scoped = df_raw.copy()
     if selected_pred_model and "Model" in scoped.columns:
@@ -1167,61 +1165,62 @@ def render_predict_price():
     if scoped.empty:
         scoped = df_raw.copy()
 
-    visible_features = [f for f in FINAL_FEATURES if f not in {"Weight", "Quart Tax"}]
     vals = {}
     with st.form("prediction_criteria_form"):
-        for row_start in range(0, len(visible_features), 2):
-            row_features = visible_features[row_start:row_start + 2]
+        # Numeric predictors use the same range-slider language as Find a Car.
+        # For prediction, the midpoint of the selected range is passed to the model.
+        numeric_features = [f for f in FINAL_FEATURES if f not in {"Automatic", "Metallic", "Doors", "Fuel Type"}]
+        categorical_features = [f for f in FINAL_FEATURES if f in {"Automatic", "Metallic", "Doors", "Fuel Type"}]
+        ordered_features = []
+        # Keep the same visual two-column rhythm as Find a Car.
+        for f in FINAL_FEATURES:
+            if f not in ordered_features:
+                ordered_features.append(f)
+
+        for row_start in range(0, len(ordered_features), 2):
+            row_features = ordered_features[row_start:row_start + 2]
             cols = st.columns(2, gap="large")
             for col_ui, feat in zip(cols, row_features):
                 s = scoped[feat]
                 with col_ui:
-                    if feat == "Age":
-                        options = _interval_options(s, 12, "bulan", start_at_zero=True)
-                        labels = [x[0] for x in options]
-                        chosen = st.selectbox(display_name(feat), labels, key=f"pred_criteria_{feat}", help="Pilih interval usia. Model menggunakan median observasi pada interval tersebut sebagai nilai numerik representatif.")
-                        vals[feat] = dict(options)[chosen]
-                    elif feat == "Kilometers":
-                        options = _interval_options(s, 25000, "km", start_at_zero=True)
-                        labels = [x[0] for x in options]
-                        chosen = st.selectbox(display_name(feat), labels, key=f"pred_criteria_{feat}", help="Pilih interval jarak tempuh. Model menggunakan median observasi pada interval tersebut sebagai nilai numerik representatif.")
-                        vals[feat] = dict(options)[chosen]
-                    elif feat == "CC":
-                        vals_num = pd.to_numeric(s, errors="coerce").dropna()
-                        choices = sorted(vals_num.unique().tolist())
-                        if not choices:
-                            choices = sorted(pd.to_numeric(df_raw[feat], errors="coerce").dropna().unique().tolist())
-                        formatted = [f"{int(v):,}" if float(v).is_integer() else f"{v:,.2f}" for v in choices]
-                        chosen = st.selectbox(display_name(feat), formatted, key=f"pred_criteria_{feat}")
-                        vals[feat] = choices[formatted.index(chosen)]
-                    elif feat in {"Automatic", "Metallic", "Doors", "Fuel Type"}:
+                    if feat in {"Automatic", "Metallic", "Doors", "Fuel Type"}:
                         options = categorical_display_options(feat, s.dropna().unique().tolist())
                         labels = [x[0] for x in options]
-                        chosen = st.radio(display_name(feat), labels, horizontal=True, key=f"pred_criteria_{feat}")
+                        chosen = st.radio(
+                            display_name(feat), labels, horizontal=True,
+                            key=f"pred_criteria_{feat}"
+                        )
                         vals[feat] = dict(options)[chosen]
                     else:
                         vals_num = pd.to_numeric(s, errors="coerce").dropna()
-                        if not vals_num.empty:
-                            choices = sorted(vals_num.unique().tolist())
-                            formatted = [f"{int(v):,}" if float(v).is_integer() else f"{v:,.2f}" for v in choices]
-                            chosen = st.selectbox(display_name(feat), formatted, key=f"pred_criteria_{feat}")
-                            vals[feat] = choices[formatted.index(chosen)]
-                        else:
+                        if vals_num.empty:
+                            vals_num = pd.to_numeric(df_raw[feat], errors="coerce").dropna()
+                        if vals_num.empty:
+                            st.info(f"Tidak ada nilai untuk {display_name(feat)}.")
                             vals[feat] = np.nan
-                            st.selectbox(display_name(feat), ["Tidak tersedia"], key=f"pred_criteria_{feat}")
+                            continue
 
-        # Hidden from the buyer UI, but retained in the model input.
-        for hidden_feat in ("Weight", "Quart Tax"):
-            if hidden_feat in FINAL_FEATURES:
-                hidden_values = pd.to_numeric(scoped[hidden_feat], errors="coerce").dropna()
-                if hidden_values.empty:
-                    hidden_values = pd.to_numeric(df_raw[hidden_feat], errors="coerce").dropna()
-                vals[hidden_feat] = float(hidden_values.median()) if not hidden_values.empty else 0.0
+                        mn = int(np.floor(vals_num.min()))
+                        mx = int(np.ceil(vals_num.max()))
+                        if mn == mx:
+                            chosen_range = (mn, mx)
+                        else:
+                            # Start at the observed median, represented as a one-point range.
+                            med = int(round(float(vals_num.median())))
+                            med = min(max(med, mn), mx)
+                            chosen_range = st.slider(
+                                display_name(feat), mn, mx, (med, med),
+                                key=f"pred_criteria_{feat}_range",
+                                help="Geser batas kiri/kanan. Untuk prediksi, nilai tengah dari rentang yang dipilih digunakan sebagai nilai input model."
+                            )
+                        if mn == mx:
+                            st.slider(display_name(feat), mn, mx, (mn, mx), key=f"pred_criteria_{feat}_range_fixed")
+                        vals[feat] = float(sum(chosen_range) / 2)
 
         submit = st.form_submit_button("Hitung Estimasi Harga  →", use_container_width=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown('<div class="prediction-note">Pajak Tahunan dan Bobot Kendaraan tetap dihitung oleh model, tetapi tidak dijadikan input terpisah. Keduanya otomatis direpresentasikan menggunakan median data pada tipe model yang dipilih.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="prediction-note">Semua 10 predictor model sekarang aktif di panel ini, termasuk <b>Pajak Tahunan</b> dan <b>Bobot Kendaraan</b>. Slider numerik menggunakan nilai tengah dari rentang yang kamu pilih; variabel kategorikal dipilih langsung seperti pada Find a Car.</div>', unsafe_allow_html=True)
 
     if submit:
         inp = pd.DataFrame([vals])
@@ -1234,43 +1233,6 @@ def render_predict_price():
             f'<div class="result-meta">Approximate model error band: €{lo:,.0f} — €{hi:,.0f}</div></div>',
             unsafe_allow_html=True,
         )
-        kpi_strip([
-            ("Estimate", f"€{pred:,.0f}", "model output"),
-            ("Rata-rata dataset", f"€{df_raw.Price.mean():,.0f}", "seluruh observasi"),
-            ("Selisih", f"€{pred-df_raw.Price.mean():,.0f}", "dibanding rata-rata"),
-            ("Test R²", f"{final_metrics_test['r2']:.3f}", "kemampuan jelaskan variasi harga"),
-        ])
-
-def render_explore_data():
-    st.markdown('<div class="eyebrow">Exploration</div><div class="page-title">Understand the data before the model.</div><div class="page-copy">Distribution, correlation, and relationships between vehicle characteristics and price.</div>', unsafe_allow_html=True)
-    st.markdown('<div class="rule"></div>', unsafe_allow_html=True)
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    section_head("Pratinjau Dataset", "Dataset yang digunakan langsung oleh aplikasi")
-    preview_df = df_raw.rename(columns=DISPLAY_LABELS)
-    st.dataframe(style_table(preview_df), use_container_width=True, hide_index=True, height=620)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    kpi_strip([
-        ("Baris", f"{len(df_raw):,}", "observasi"),
-        ("Kolom", len(df_raw.columns), "variabel awal"),
-        ("Rata-rata Harga", f"€{df_raw.Price.mean():,.0f}", "rata-rata"),
-        ("Extreme", f"{int(extreme_mask.sum()):,}", "observasi unik"),
-    ])
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    section_head("Extreme Value Analysis", "Deteksi nilai ekstrem menggunakan percentile P1 dan P99 pada tujuh variabel numerik")
-    st.dataframe(extreme_summary.style.set_table_styles([{ "selector": "th", "props": [("background-color", "#252627"), ("color", "#ffffff"), ("font-weight", "700")] }]).format({
-        "P1 (1%)": "{:,.2f}", "P99 (99%)": "{:,.2f}",
-        "Lower Extreme (<P1)": "{:,.0f}", "Upper Extreme (>P99)": "{:,.0f}", "Total Extreme": "{:,.0f}"
-    }), use_container_width=True, hide_index=True)
-    if not extreme_observations.empty:
-        st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
-        st.caption(f"{len(extreme_observations):,} deteksi variabel-observasi. Satu ID dapat muncul lebih dari sekali jika ekstrem pada beberapa variabel.")
-        st.dataframe(extreme_observations.style.set_table_styles([{ "selector": "th", "props": [("background-color", "#252627"), ("color", "#ffffff"), ("font-weight", "700")] }]).format({"Nilai":"{:,.2f}", "P1":"{:,.2f}", "P99":"{:,.2f}"}), use_container_width=True, hide_index=True, height=330)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-
 
 
 def render_model_evaluation():
