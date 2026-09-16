@@ -630,6 +630,7 @@ input[type="radio"],input[type="checkbox"]{accent-color:#777b7f!important}
 
 
 /* V19 visual system: neutral gray only, no red accents. */
+.group-badge{display:inline-flex;align-items:center;padding:7px 12px;border-radius:999px;background:rgba(255,255,255,.72);border:1px solid rgba(0,0,0,.08);box-shadow:0 6px 18px rgba(0,0,0,.05);font-size:11px;font-weight:700;letter-spacing:.02em;color:#333!important;}
 .top-meta{display:flex;align-items:center;justify-content:flex-end;gap:12px;margin-bottom:20px;color:#666b70!important;font-size:11px}.top-meta *{color:#666b70!important}.top-meta .avatar{color:#fff!important;background:#171717!important}
 .search-pill{display:none!important}
 [data-testid="stAppViewContainer"] button, [data-testid="stSidebar"] button{accent-color:#777b7f!important}
@@ -998,7 +999,10 @@ def form_values(prefix, selected_model):
             chosen = col.selectbox(display_name(feat), labels, key=f"{prefix}_{feat}", help="Pilih interval jarak tempuh. Nilai yang dikirim ke model adalah median observasi pada interval tersebut.")
             vals[feat] = dict(options)[chosen]
 
-        elif feat in {"CC", "Weight", "Quart Tax"}:
+        elif feat in {"CC"}:
+            # CC tetap menjadi input karena merupakan spesifikasi utama yang mudah
+            # dipilih pengguna; pilihan dibatasi pada nilai yang benar-benar ada
+            # pada tipe/model yang dipilih.
             vals_num = pd.to_numeric(s, errors="coerce").dropna()
             choices = sorted(vals_num.unique().tolist())
             if not choices:
@@ -1006,6 +1010,15 @@ def form_values(prefix, selected_model):
             formatted = [f"{int(v):,}" if float(v).is_integer() else f"{v:,.2f}" for v in choices]
             chosen = col.selectbox(display_name(feat), formatted, key=f"{prefix}_{feat}", help="Pilihan dibatasi pada nilai yang benar-benar tersedia untuk tipe model yang dipilih.")
             vals[feat] = choices[formatted.index(chosen)]
+
+        elif feat in {"Weight", "Quart Tax"}:
+            # Bobot dan pajak tetap masuk ke persamaan regresi, tetapi tidak
+            # ditampilkan sebagai field input terpisah. Nilainya diisi otomatis
+            # dari median observasi pada tipe/model yang dipilih.
+            vals_num = pd.to_numeric(s, errors="coerce").dropna()
+            if vals_num.empty:
+                vals_num = pd.to_numeric(df_raw[feat], errors="coerce").dropna()
+            vals[feat] = float(vals_num.median()) if not vals_num.empty else np.nan
 
         elif feat in {"Automatic", "Metallic", "Doors"}:
             options = categorical_display_options(feat, s.dropna().unique().tolist())
@@ -1297,7 +1310,7 @@ def render_model_evaluation():
 
 # TOP META
 st.markdown(
-    f"""<div class="top-meta"><span>Regression workspace · {len(FINAL_FEATURES)+1} variables used</span><span class="avatar">DA</span></div>""",
+    f"""<div class="top-meta"><span>Regression workspace · {len(FINAL_FEATURES)+1} variables used</span><span class="group-badge">Kelompok 5 · Kelas A</span><span class="avatar">DA</span></div>""",
     unsafe_allow_html=True,
 )
 
@@ -1484,24 +1497,38 @@ if page == "Dashboard":
 
         st.markdown('<div style="height:18px"></div>', unsafe_allow_html=True)
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        section_head("Scatterplot per Variabel", "Setiap predictor numerik diplot terhadap Harga Mobil untuk melihat hubungan bivariate")
+        section_head("Scatterplot per Variabel", "Pilih satu variabel untuk melihat hubungan bivariate dengan Harga Mobil")
         numeric_features = [c for c in ANALYSIS_FEATURES if c in df_model.columns and pd.api.types.is_numeric_dtype(df_model[c])]
-        for row_start in range(0, len(numeric_features), 2):
-            chart_cols = st.columns(2)
-            for j, feat in enumerate(numeric_features[row_start:row_start + 2]):
-                with chart_cols[j]:
-                    plot_df = df_model[[feat, "Price"]].copy()
-                    plot_df[feat] = pd.to_numeric(plot_df[feat], errors="coerce")
-                    plot_df["Price"] = pd.to_numeric(plot_df["Price"], errors="coerce")
-                    plot_df = plot_df.dropna()
-                    if len(plot_df) > 1 and plot_df[feat].nunique() > 1:
-                        var_fig = px.scatter(plot_df, x=feat, y="Price", trendline="ols", opacity=.55)
-                        var_fig.update_traces(marker=dict(size=5, color="#222222"))
-                        var_fig.update_xaxes(title=display_name(feat))
-                        var_fig.update_yaxes(title="Harga Mobil (€)")
-                        show_chart(plot_layout(var_fig, 330), f"{display_name(feat)} vs Harga Mobil", f"dash_scatter_{feat.lower().replace(' ', '_')}")
-                    else:
-                        st.info(f"Data {display_name(feat)} tidak cukup untuk scatterplot.")
+        if numeric_features:
+            selected_scatter = st.selectbox(
+                "Variabel",
+                numeric_features,
+                format_func=display_name,
+                key="dash_scatter_variable",
+            )
+            feat = selected_scatter
+            plot_df = df_model[[feat, "Price"]].copy()
+            plot_df[feat] = pd.to_numeric(plot_df[feat], errors="coerce")
+            plot_df["Price"] = pd.to_numeric(plot_df["Price"], errors="coerce")
+            plot_df = plot_df.dropna()
+            if len(plot_df) > 1 and plot_df[feat].nunique() > 1:
+                var_fig = px.scatter(plot_df, x=feat, y="Price", trendline="ols", opacity=.55)
+                var_fig.update_traces(marker=dict(size=5, color="#222222"))
+                var_fig.update_xaxes(title=display_name(feat))
+                var_fig.update_yaxes(title="Harga Mobil (€)")
+                show_chart(plot_layout(var_fig, 430), f"Hubungan {display_name(feat)} dengan Harga Mobil", f"dash_scatter_{feat.lower().replace(' ', '_')}")
+                # Interpretasi mengikuti variabel yang sedang dipilih.
+                corr_val = pd.to_numeric(plot_df[feat], errors="coerce").corr(pd.to_numeric(plot_df["Price"], errors="coerce"))
+                if pd.notna(corr_val):
+                    direction = "positif" if corr_val >= 0 else "negatif"
+                    strength = ("kuat" if abs(corr_val) >= .70 else "sedang" if abs(corr_val) >= .40 else "lemah")
+                    render_insight((
+                        f"Hubungan antara {display_name(feat)} dan Harga Mobil memiliki Pearson r = {corr_val:.2f}, sehingga arah hubungan bivariatenya cenderung {direction} dengan kekuatan {strength}.",
+                        "Garis tren membantu melihat arah pola rata-rata, sedangkan sebaran titik menunjukkan bahwa tidak semua kendaraan mengikuti pola yang sama.",
+                        "Scatterplot ini adalah pemeriksaan bivariate awal; hasilnya tidak menggantikan multiple regression yang mempertimbangkan predictor secara simultan."
+                    ))
+            else:
+                st.info(f"Data {display_name(feat)} tidak cukup untuk scatterplot.")
         st.markdown('</div>', unsafe_allow_html=True)
 
     with dash_tabs[5]:
