@@ -658,6 +658,13 @@ input[type="radio"], input[type="checkbox"]{accent-color:#777b7f!important;}
 [data-testid="stSlider"] [role="slider"]{background:#777b7f!important;border-color:#777b7f!important;}
 [data-testid="stCheckbox"] [role="checkbox"]{border-color:#b8bdc1!important;}
 [data-testid="stCheckbox"] [role="checkbox"][aria-checked="true"]{background:#777b7f!important;border-color:#777b7f!important;}
+/* Final tab interaction: inactive tabs are text-only; active tab gets a white rounded surface. */
+.stTabs [data-baseweb="tab-list"]{background:transparent!important;border:0!important;padding:3px!important;gap:6px!important}
+.stTabs [data-baseweb="tab"]{background:transparent!important;background-color:transparent!important;border:1px solid transparent!important;border-radius:12px!important;box-shadow:none!important;color:#171717!important;padding:0 16px!important}
+.stTabs [data-baseweb="tab"] *{background:transparent!important;color:#171717!important;-webkit-text-fill-color:#171717!important}
+.stTabs [data-baseweb="tab"][aria-selected="true"]{background:#fff!important;background-color:#fff!important;border:1px solid rgba(0,0,0,.08)!important;border-radius:12px!important;box-shadow:0 7px 18px rgba(0,0,0,.06)!important}
+.stTabs [data-baseweb="tab"][aria-selected="true"] *{background:transparent!important;color:#171717!important;-webkit-text-fill-color:#171717!important}
+.stTabs [data-baseweb="tab-highlight"],.stTabs [data-baseweb="tab-border"]{display:none!important;background:transparent!important;border:0!important}
 </style>
 """,
     unsafe_allow_html=True,
@@ -935,37 +942,91 @@ def predict_input(input_df):
     return max(pred, 0)
 
 
-def form_values(prefix):
-    """Build prediction inputs with numeric fields and non-dropdown choices for categorical fields."""
+def _interval_options(series, width, unit_label="", start_at_zero=False):
+    """Create human-readable dropdown intervals from the observed dataset range."""
+    vals = pd.to_numeric(series, errors="coerce").dropna()
+    if vals.empty:
+        return []
+    lo = int(np.floor(vals.min()))
+    hi = int(np.ceil(vals.max()))
+    start = 0 if start_at_zero else max(0, (lo // width) * width)
+    options = []
+    current = start
+    while current <= hi:
+        end = current + width
+        label = f"{current:,}–{end:,}{(' ' + unit_label) if unit_label else ''}"
+        mask = vals.between(current, end, inclusive="left")
+        observed = vals[mask]
+        representative = float(observed.median()) if not observed.empty else float((current + end) / 2)
+        options.append((label, representative))
+        current = end
+    return options
+
+
+def _model_scoped_values(selected_model, feature):
+    """Return values actually observed for the selected simplified model type."""
+    work = df_raw.copy()
+    if selected_model and "Model" in work.columns:
+        work = work[work["Model"].map(simplify_model_name) == selected_model]
+    vals = pd.to_numeric(work[feature], errors="coerce").dropna().unique().tolist()
+    return sorted(vals)
+
+
+def form_values(prefix, selected_model):
+    """Build prediction inputs as guided dropdowns, scoped to the selected model type."""
     vals = {}
     cols = st.columns(2)
-    binary_cols = {"Automatic", "Metallic"}
+    scoped = df_raw.copy()
+    if selected_model and "Model" in scoped.columns:
+        scoped = scoped[scoped["Model"].map(simplify_model_name) == selected_model]
+    if scoped.empty:
+        scoped = df_raw.copy()
+
     for i, feat in enumerate(FINAL_FEATURES):
         col = cols[i % 2]
-        s = df_raw[feat]
-        if feat in binary_cols:
-            options = categorical_display_options(feat, s.dropna().unique().tolist())
+        s = scoped[feat]
+
+        if feat == "Age":
+            options = _interval_options(s, 12, "bulan", start_at_zero=True)
             labels = [x[0] for x in options]
-            chosen = col.radio(display_name(feat), labels, horizontal=True, key=f"{prefix}_{feat}")
+            chosen = col.selectbox(display_name(feat), labels, key=f"{prefix}_{feat}", help="Pilih interval usia. Model menggunakan median observasi pada interval tersebut sebagai nilai numerik representatif.")
             vals[feat] = dict(options)[chosen]
-        elif feat == "Doors":
-            options = categorical_display_options(feat, s.dropna().unique().tolist())
+
+        elif feat == "Kilometers":
+            options = _interval_options(s, 25000, "km", start_at_zero=True)
             labels = [x[0] for x in options]
-            chosen = col.radio(display_name(feat), labels, horizontal=True, key=f"{prefix}_{feat}")
+            chosen = col.selectbox(display_name(feat), labels, key=f"{prefix}_{feat}", help="Pilih interval jarak tempuh. Nilai yang dikirim ke model adalah median observasi pada interval tersebut.")
             vals[feat] = dict(options)[chosen]
-        elif not pd.api.types.is_numeric_dtype(s):
-            choices = sorted(s.dropna().astype(str).unique().tolist())
-            vals[feat] = col.radio(display_name(feat), choices, horizontal=True, key=f"{prefix}_{feat}") if len(choices) <= 5 else col.selectbox(display_name(feat), choices, key=f"{prefix}_{feat}")
-        else:
+
+        elif feat in {"CC", "Weight", "Quart Tax"}:
             vals_num = pd.to_numeric(s, errors="coerce").dropna()
-            mn = float(vals_num.min())
-            mx = float(vals_num.max())
-            med = float(vals_num.median())
-            is_int = np.all(np.isclose(vals_num, np.round(vals_num)))
-            if is_int:
-                vals[feat] = col.number_input(display_name(feat), min_value=int(round(mn)), max_value=int(round(mx)), value=int(round(med)), step=1, format="%d", key=f"{prefix}_{feat}")
+            choices = sorted(vals_num.unique().tolist())
+            if not choices:
+                choices = sorted(pd.to_numeric(df_raw[feat], errors="coerce").dropna().unique().tolist())
+            formatted = [f"{int(v):,}" if float(v).is_integer() else f"{v:,.2f}" for v in choices]
+            chosen = col.selectbox(display_name(feat), formatted, key=f"{prefix}_{feat}", help="Pilihan dibatasi pada nilai yang benar-benar tersedia untuk tipe model yang dipilih.")
+            vals[feat] = choices[formatted.index(chosen)]
+
+        elif feat in {"Automatic", "Metallic", "Doors"}:
+            options = categorical_display_options(feat, s.dropna().unique().tolist())
+            labels = [x[0] for x in options]
+            chosen = col.selectbox(display_name(feat), labels, key=f"{prefix}_{feat}")
+            vals[feat] = dict(options)[chosen]
+
+        elif feat == "Fuel Type":
+            options = categorical_display_options(feat, s.dropna().unique().tolist())
+            labels = [x[0] for x in options]
+            chosen = col.selectbox(display_name(feat), labels, key=f"{prefix}_{feat}")
+            vals[feat] = dict(options)[chosen]
+
+        else:
+            choices = sorted(s.dropna().astype(str).unique().tolist())
+            if choices:
+                chosen = col.selectbox(display_name(feat), choices, key=f"{prefix}_{feat}")
+                vals[feat] = chosen
             else:
-                vals[feat] = col.number_input(display_name(feat), min_value=mn, max_value=mx, value=med, step=0.01, format="%.2f", key=f"{prefix}_{feat}")
+                vals[feat] = np.nan
+
     return pd.DataFrame([vals])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1065,7 +1126,7 @@ def render_predict_price():
             if "Model" in df_raw.columns:
                 pred_model_options = sorted([x for x in df_raw["Model"].dropna().map(simplify_model_name).unique().tolist() if x])
                 selected_pred_model = st.selectbox("Tipe Model", pred_model_options, key="single_pred_model")
-            inp = form_values("single_v4")
+            inp = form_values("single_v5", selected_pred_model)
             submit = st.form_submit_button("Hitung Estimasi Harga  →", use_container_width=True)
         if "Model" in df_raw.columns:
             st.caption("Model dipakai sebagai kriteria mobil. Jika Model tidak dipilih sebagai prediktor regresi di sidebar, pilihan ini tidak mengubah persamaan model.")
@@ -1253,7 +1314,7 @@ if page == "Dashboard":
         ("Model", "Multiple Linear Regression", "OLS · 10 predictor"),
     ])
 
-    dash_tabs = st.tabs(["Dataset & Model", "Histogram", "Boxplot", "Heatmap", "Mean Price Heatmap", "Scatterplot", "Residuals", "Extreme Values"])
+    dash_tabs = st.tabs(["Dataset & Model", "Histogram", "Boxplot", "Heatmap", "Scatterplot", "Residuals", "Extreme Values"])
 
     with dash_tabs[0]:
         # Regression equation comes first, followed by EDA, model evaluation, then dataset.
@@ -1267,6 +1328,10 @@ if page == "Dashboard":
             safe=str(display_name(row["Feature"])).replace("_",r"\_").replace(" ",r"\ ")
             expr += rf" {sign} {abs(coef):,.2f}\times\text{{{safe}}}"
         st.latex(expr)
+        st.markdown('<div class="equation-note"><b>Dari mana angka koefisien?</b><br>Semua angka pada persamaan merupakan hasil estimasi <b>OLS dari training data</b> setelah preprocessing dan treatment extreme value yang sedang aktif. Koefisien dibaca sebagai perubahan rata-rata prediksi Harga Mobil untuk kenaikan 1 unit predictor, dengan predictor lain dianggap konstan. Untuk Fuel Type, koefisien dummy dibaca terhadap reference category.</div>', unsafe_allow_html=True)
+        coef_explain=final_coef_df.copy(); coef_explain["Variabel"]=coef_explain["Feature"].map(display_name); coef_explain["Koefisien"]=coef_explain["Coefficient"]
+        coef_explain["Penjelasan"] = coef_explain.apply(lambda r: "Intercept/β₀: konstanta hasil estimasi OLS" if str(r["Feature"])=="Intercept" else f"Koefisien OLS untuk {display_name(r['Feature'])}: perubahan rata-rata Harga Mobil untuk kenaikan 1 unit, predictor lain konstan", axis=1)
+        st.dataframe(style_table(coef_explain[["Variabel","Koefisien","Penjelasan"]]).format({"Koefisien":"{:,.2f}"}),use_container_width=True,hide_index=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
         st.markdown('<div class="card" style="margin-top:16px">', unsafe_allow_html=True)
@@ -1378,39 +1443,68 @@ if page == "Dashboard":
         strongest=price_corr.index[0] if len(price_corr) else "-"; strongest_val=price_corr.iloc[0] if len(price_corr) else np.nan
         heat_dir = "positif" if strongest_val >= 0 else "negatif"
         render_insight((f"Hubungan linear numerik terkuat dengan Price adalah {display_name(str(strongest))}, dengan Pearson r = {strongest_val:.2f}.", f"Arah hubungan tersebut cenderung {heat_dir}; Price cenderung bergerak {('naik' if strongest_val >= 0 else 'turun')} ketika predictor meningkat secara linear.", "Temuan ini menjadi gambaran awal sebelum seluruh predictor dianalisis simultan. Korelasi bivariate bukan bukti sebab-akibat dan tidak menggantikan multiple regression."))
+
+        st.markdown('<div style="height:18px"></div>', unsafe_allow_html=True)
+        section_head("Mean Price Heatmap", "Rata-rata Harga Mobil berdasarkan Jenis Bahan Bakar dan Jumlah Pintu")
+        work = df_model.copy()
+        work["Doors"] = pd.to_numeric(work["Doors"], errors="coerce")
+        work["Price"] = pd.to_numeric(work["Price"], errors="coerce")
+        work = work.dropna(subset=["Fuel Type", "Doors", "Price"])
+        mean_pivot = work.pivot_table(index="Fuel Type", columns="Doors", values="Price", aggfunc="mean").sort_index()
+        if not mean_pivot.empty:
+            mean_pivot.columns = [str(int(c)) for c in mean_pivot.columns]
+            mean_fig = px.imshow(mean_pivot, text_auto=".0f", aspect="auto", color_continuous_scale=[[0,"#f2f2f2"],[.5,"#9a9a9a"],[1,"#171717"]])
+            mean_fig.update_coloraxes(colorbar_title="Rata-rata Harga (€)")
+            mean_fig.update_xaxes(title="Doors")
+            mean_fig.update_yaxes(title="Fuel Type")
+            show_chart(plot_layout(mean_fig, max(360, 80 + 50 * len(mean_pivot.index))), "Rata-rata Harga Berdasarkan Fuel Type dan Doors", "dash_mean_heatmap_combined")
+            render_insight(chart_interpretation_mean_heatmap(df_model))
+        else:
+            st.info("Data Fuel Type, Doors, dan Price tidak cukup untuk membuat heatmap rata-rata.")
         st.markdown('</div>', unsafe_allow_html=True)
 
     with dash_tabs[4]:
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        section_head("Rata-rata Harga Mobil Berdasarkan Jenis Bahan Bakar dan Jumlah Pintu", "Membandingkan rata-rata harga antar kelompok")
-        work=df_model.copy()
-        work["Doors"]=pd.to_numeric(work["Doors"],errors="coerce")
-        work["Price"]=pd.to_numeric(work["Price"],errors="coerce")
-        work=work.dropna(subset=["Fuel Type","Doors","Price"])
-        mean_pivot=work.pivot_table(index="Fuel Type", columns="Doors", values="Price", aggfunc="mean").sort_index()
-        if not mean_pivot.empty:
-            mean_pivot.columns=[str(int(c)) for c in mean_pivot.columns]
-            fig=px.imshow(mean_pivot,text_auto=".0f",aspect="auto",color_continuous_scale=[[0,"#f2f2f2"],[.5,"#9a9a9a"],[1,"#171717"]])
-            fig.update_coloraxes(colorbar_title="Rata-rata Harga (€)")
-            fig.update_xaxes(title="Doors"); fig.update_yaxes(title="Fuel Type")
-            show_chart(plot_layout(fig,max(360,80+50*len(mean_pivot.index))), "Rata-rata Harga Berdasarkan Fuel Type dan Doors", "dash_mean_heatmap")
-            render_insight(chart_interpretation_mean_heatmap(df_model))
-        else:
-            st.info("Data Fuel Type, Doors, dan Price tidak cukup untuk membuat heatmap.")
+        section_head("Actual vs Predicted Price", "Scatterplot evaluasi model pada data test; garis diagonal menunjukkan prediksi ideal")
+        actual_pred = pd.DataFrame({"Harga Aktual": final_y_test.values, "Harga Prediksi": final_y_pred_test.values})
+        fig = px.scatter(actual_pred, x="Harga Aktual", y="Harga Prediksi", opacity=.62)
+        fig.update_traces(marker=dict(size=6, color="#222222"))
+        lo = min(float(actual_pred["Harga Aktual"].min()), float(actual_pred["Harga Prediksi"].min()))
+        hi = max(float(actual_pred["Harga Aktual"].max()), float(actual_pred["Harga Prediksi"].max()))
+        fig.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines", line=dict(color="#666666", width=2), name="Prediksi ideal"))
+        fig.update_xaxes(title="Harga Aktual (€)")
+        fig.update_yaxes(title="Harga Prediksi (€)")
+        show_chart(plot_layout(fig, 470), "Harga Aktual vs Harga Prediksi", "dash_actual_predicted")
+        render_insight((
+            f"Sebagian besar titik berada di sekitar garis prediksi ideal; jarak titik dari garis menunjukkan besar error masing-masing observasi.",
+            f"Titik di atas garis berarti model memprediksi lebih tinggi daripada harga aktual, sedangkan titik di bawah garis berarti model memprediksi lebih rendah.",
+            "Plot ini melihat performa prediksi secara langsung. Untuk membaca apakah error memiliki pola sistematis, gunakan subpage Residuals."
+        ))
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown('<div style="height:18px"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        section_head("Scatterplot per Variabel", "Setiap predictor numerik diplot terhadap Harga Mobil untuk melihat hubungan bivariate")
+        numeric_features = [c for c in ANALYSIS_FEATURES if c in df_model.columns and pd.api.types.is_numeric_dtype(df_model[c])]
+        for row_start in range(0, len(numeric_features), 2):
+            chart_cols = st.columns(2)
+            for j, feat in enumerate(numeric_features[row_start:row_start + 2]):
+                with chart_cols[j]:
+                    plot_df = df_model[[feat, "Price"]].copy()
+                    plot_df[feat] = pd.to_numeric(plot_df[feat], errors="coerce")
+                    plot_df["Price"] = pd.to_numeric(plot_df["Price"], errors="coerce")
+                    plot_df = plot_df.dropna()
+                    if len(plot_df) > 1 and plot_df[feat].nunique() > 1:
+                        var_fig = px.scatter(plot_df, x=feat, y="Price", trendline="ols", opacity=.55)
+                        var_fig.update_traces(marker=dict(size=5, color="#222222"))
+                        var_fig.update_xaxes(title=display_name(feat))
+                        var_fig.update_yaxes(title="Harga Mobil (€)")
+                        show_chart(plot_layout(var_fig, 330), f"{display_name(feat)} vs Harga Mobil", f"dash_scatter_{feat.lower().replace(' ', '_')}")
+                    else:
+                        st.info(f"Data {display_name(feat)} tidak cukup untuk scatterplot.")
         st.markdown('</div>', unsafe_allow_html=True)
 
     with dash_tabs[5]:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        section_head("Hubungan Variabel dengan Harga Mobil", "Melihat pola hubungan variabel numerik dengan Harga Mobil")
-        numeric_list=[c for c in eligible if c!="Fuel Type" and pd.api.types.is_numeric_dtype(df_model[c])]
-        x=st.selectbox("Variabel X",numeric_list,index=numeric_list.index("Age") if "Age" in numeric_list else 0,format_func=display_name,key="dash_scatter_x")
-        fig=px.scatter(df_model,x=x,y="Price",trendline="ols",opacity=.58); fig.update_traces(marker=dict(size=5,color="#171717")); fig.update_xaxes(title=display_name(x)); fig.update_yaxes(title="Harga Mobil (€)")
-        show_chart(plot_layout(fig,460), f"Hubungan {display_name(x)} dengan Harga Mobil", "dash_scatter")
-        r=df_model[[x,"Price"]].corr().iloc[0,1]; direction="positif" if r>=0 else "negatif"
-        render_insight((f"Scatterplot {display_name(x)} vs Price menunjukkan kecenderungan linear {direction}, dengan Pearson r = {r:.2f}.", f"Nilai r menunjukkan arah dan kekuatan hubungan dua variabel; penyebaran titik menunjukkan bahwa {display_name(x)} bukan satu-satunya informasi yang berkaitan dengan Price.", "Plot ini membantu memahami hubungan bivariate dan observasi yang menyimpang, sedangkan model utama tetap menggunakan seluruh predictor secara simultan."))
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with dash_tabs[6]:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         section_head("Pola Residual Model", "Memeriksa pola kesalahan prediksi pada data test")
         residual_df=pd.DataFrame({"Harga Prediksi":final_y_pred_test.values,"Residual":final_y_test.values-final_y_pred_test.values})
@@ -1422,7 +1516,7 @@ if page == "Dashboard":
         render_insight((f"Residual memiliki median {resid.median():,.0f}; MAE test = €{final_metrics_test['mae']:,.0f} menjadi pembanding besar error tipikal.", f"Hubungan residual dengan harga prediksi {pattern_note} (r = {corr_resid_pred:.2f} bila tersedia).", "Residual plot digunakan untuk mencari pola error yang belum tertangkap model. Bentuk kipas, lengkungan, atau kelompok residual yang sistematis perlu diperiksa lebih lanjut."))
         st.markdown('</div>', unsafe_allow_html=True)
 
-    with dash_tabs[7]:
+    with dash_tabs[6]:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         section_head("Extreme Value Analysis", "Deteksi P1/P99 pada tujuh variabel numerik")
         st.dataframe(extreme_summary.style.set_table_styles([{ "selector":"th", "props":[("background-color","#252627"),("color","#ffffff"),("font-weight","700")] }]).format({"P1 (1%)":"{:,.2f}","P99 (99%)":"{:,.2f}","Lower Extreme (<P1)":"{:,.0f}","Upper Extreme (>P99)":"{:,.0f}","Total Extreme":"{:,.0f}"}),use_container_width=True,hide_index=True)
