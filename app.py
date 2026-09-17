@@ -755,7 +755,6 @@ outlier_treatment = st.sidebar.radio(
     ["Keep Outliers", "Remove Outliers"],
     index=1,
 )
-compare_both_models = st.sidebar.checkbox("Compare Both Models", value=False)
 
 st.sidebar.markdown('<div class="sidebar-divider"></div>', unsafe_allow_html=True)
 st.sidebar.markdown(
@@ -849,13 +848,6 @@ def compare_models(df_json, clean_json, features, split, scale):
         },
     ])
     return table
-
-comparison_table = None
-if compare_both_models:
-    comparison_table = compare_models(
-        df_raw.to_json(), df_model.to_json(), tuple(FINAL_FEATURES), split_pct, standardize
-    )
-
 
 def plot_layout(fig, height=None):
     fig.update_layout(
@@ -1151,8 +1143,9 @@ def render_predict_price():
     st.markdown('<div class="rule"></div>', unsafe_allow_html=True)
 
     pred_model_options = sorted([x for x in df_raw["Model"].dropna().map(simplify_model_name).unique().tolist() if x]) if "Model" in df_raw.columns else []
+    pred_model_options = ["Semua Tipe Model"] + pred_model_options
     selected_pred_model = st.selectbox(
-        "Tipe Model", pred_model_options, key="single_pred_model",
+        "Tipe Model", pred_model_options, index=0, key="single_pred_model",
         help="Pilih tipe Toyota Corolla sebagai konteks kendaraan. Model tidak digunakan sebagai predictor regresi."
     ) if pred_model_options else None
 
@@ -1161,12 +1154,13 @@ def render_predict_price():
     st.caption("Jenis bahan bakar mengikuti seluruh kategori yang tersedia pada dataset: CNG, Diesel, dan Petrol.")
 
     scoped = df_raw.copy()
-    if selected_pred_model and "Model" in scoped.columns:
+    if selected_pred_model and selected_pred_model != "Semua Tipe Model" and "Model" in scoped.columns:
         scoped = scoped[scoped["Model"].map(simplify_model_name) == selected_pred_model]
     if scoped.empty:
         scoped = df_raw.copy()
 
     vals = {}
+    selected_categorical = {}
     with st.form("prediction_criteria_form"):
         # Numeric predictors use the same range-slider language as Find a Car.
         # For prediction, the midpoint of the selected range is passed to the model.
@@ -1194,10 +1188,19 @@ def render_predict_price():
                         options = categorical_display_options(feat, option_source)
                         labels = [x[0] for x in options]
                         chosen = st.radio(
-                            display_name(feat), labels, horizontal=True,
+                            display_name(feat), ["Semua"] + labels, index=0, horizontal=True,
                             key=f"pred_criteria_{feat}"
                         )
-                        vals[feat] = dict(options)[chosen]
+                        selected_categorical[feat] = chosen
+                        if chosen == "Semua":
+                            # "Semua" tidak dipaksa menjadi satu kategori. Nilai modus
+                            # hanya dipakai sebagai baseline untuk proses matching; saat
+                            # prediksi dijalankan, seluruh kombinasi kategori yang dipilih
+                            # akan dihitung sebagai skenario terpisah.
+                            mode_values = df_raw[feat].dropna().tolist()
+                            vals[feat] = pd.Series(mode_values).mode().iloc[0] if mode_values else np.nan
+                        else:
+                            vals[feat] = dict(options)[chosen]
                     else:
                         vals_num = pd.to_numeric(s, errors="coerce").dropna()
                         if vals_num.empty:
@@ -1227,25 +1230,66 @@ def render_predict_price():
         submit = st.form_submit_button("Hitung Estimasi Harga  →", use_container_width=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown('<div class="prediction-note">Semua 10 predictor model aktif di panel ini. Slider numerik mengikuti pola <b>Your criteria</b> pada Find a Car, sedangkan variabel kategorikal dipilih langsung. Nilai tengah rentang numerik digunakan sebagai input prediksi.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="prediction-note">Semua 10 predictor model aktif di panel ini. Slider numerik mengikuti pola <b>Your criteria</b> pada Find a Car. Jika variabel kategorikal dipilih <b>Semua</b>, sistem menghitung estimasi untuk setiap kategori sehingga perbedaan harga antar kategori tetap terlihat.</div>', unsafe_allow_html=True)
 
     if submit:
-        inp = pd.DataFrame([vals])
-        pred = predict_input(inp)
+        # Opsi "Semua" menghasilkan beberapa skenario prediksi, bukan diam-diam
+        # menggantinya dengan kategori modus. Jika lebih dari satu variabel kategorikal
+        # bernilai "Semua", seluruh kombinasi kategorinya dihitung (cartesian product).
+        categorical_model_features = [f for f in ["Automatic", "Metallic", "Doors", "Fuel Type"] if f in FINAL_FEATURES]
+        scenario_options = {}
+        for feat in categorical_model_features:
+            options = categorical_display_options(feat, df_raw[feat].dropna().unique().tolist())
+            if selected_categorical.get(feat) == "Semua":
+                scenario_options[feat] = options
+            else:
+                scenario_options[feat] = [next((x for x in options if x[0] == selected_categorical.get(feat)), (selected_categorical.get(feat), vals.get(feat)))]
+
+        import itertools
+        scenario_rows = []
         margin = 1.96 * final_metrics_test["rmse"]
-        lo, hi = max(0, pred - margin), pred + margin
-        st.markdown(
-            f'<div class="result-card"><div class="result-label">Estimated price</div>'
-            f'<div class="result-value">€{pred:,.0f}</div>'
-            f'<div class="result-meta">Approximate model error band: €{lo:,.0f} — €{hi:,.0f}</div></div>',
-            unsafe_allow_html=True,
-        )
+        for combo in itertools.product(*[scenario_options[f] for f in categorical_model_features]):
+            scenario_vals = dict(vals)
+            scenario_labels = {}
+            for feat, (label, raw_value) in zip(categorical_model_features, combo):
+                scenario_vals[feat] = raw_value
+                scenario_labels[feat] = label
+            scenario_pred = float(predict_input(pd.DataFrame([scenario_vals])))
+            scenario_lo = max(0, scenario_pred - margin)
+            scenario_hi = scenario_pred + margin
+            scenario_rows.append({
+                **scenario_labels,
+                "Estimated Price": scenario_pred,
+                "Lower Band": scenario_lo,
+                "Upper Band": scenario_hi,
+            })
+
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        section_head("Estimated Price by Category", "Jika memilih Semua, model menghitung setiap kategori yang tersedia pada dataset")
+        if len(scenario_rows) == 1:
+            row = scenario_rows[0]
+            pred = row["Estimated Price"]
+            st.markdown(
+                f'<div class="result-card"><div class="result-label">Estimated price</div>'
+                f'<div class="result-value">€{pred:,.0f}</div>'
+                f'<div class="result-meta">Approximate model error band: €{row["Lower Band"]:,.0f} — €{row["Upper Band"]:,.0f}</div></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            scenario_df = pd.DataFrame(scenario_rows)
+            scenario_df = scenario_df.rename(columns=DISPLAY_LABELS)
+            for col in ["Estimated Price", "Lower Band", "Upper Band"]:
+                if col in scenario_df.columns:
+                    scenario_df[col] = scenario_df[col].map(lambda x: f"€{x:,.0f}")
+            st.dataframe(style_table(scenario_df), use_container_width=True, hide_index=True)
+            st.caption(f"Total {len(scenario_rows)} skenario kategori dihitung dari kombinasi pilihan kategorikal yang dipilih.")
+        st.markdown('</div>', unsafe_allow_html=True)
 
         # Cari kendaraan yang benar-benar memenuhi kriteria yang baru dipilih.
         # Model type mengikuti simplified model, numerik mengikuti rentang slider,
         # dan kategorikal harus sama persis dengan pilihan pengguna.
         matching = df_raw.copy()
-        if selected_pred_model and "Model" in matching.columns:
+        if selected_pred_model and selected_pred_model != "Semua Tipe Model" and "Model" in matching.columns:
             matching = matching[matching["Model"].map(simplify_model_name) == selected_pred_model]
 
         # Simpan rentang numerik dari widget untuk digunakan lagi pada matching.
@@ -1263,6 +1307,9 @@ def render_predict_price():
                 matching = matching[vals_series.between(left, right, inclusive="both")]
 
         for feat in {"Automatic", "Metallic", "Doors", "Fuel Type"}.intersection(FINAL_FEATURES):
+            # "Semua" berarti jangan memfilter kolom ini pada Matching Cars.
+            if selected_categorical.get(feat) == "Semua":
+                continue
             if feat in vals and feat in matching.columns:
                 try:
                     matching = matching[matching[feat] == vals[feat]]
@@ -1343,29 +1390,6 @@ def render_model_evaluation():
     ot2.metric("Data extreme", f"{int(extreme_mask.sum()):,}")
     ot3.metric("Data setelah removal", f"{len(df_model):,}")
     st.caption("Raw/original dataset tidak diubah. Removal hanya diterapkan pada salinan data yang digunakan untuk modeling.")
-    if compare_both_models and comparison_table is not None:
-        st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
-        st.markdown('<div class="card-title">Model Comparison</div>', unsafe_allow_html=True)
-        st.dataframe(comparison_table.style.set_table_styles([{ "selector": "th", "props": [("background-color", "#252627"), ("color", "#ffffff"), ("font-weight", "700")] }]).format({
-            "R² Train":"{:.4f}", "R² Test":"{:.4f}", "Adjusted R²":"{:.4f}",
-            "MAE Test":"€ {:,.0f}", "RMSE Test":"€ {:,.0f}", "MAPE Test":"{:.2f}%"
-        }), use_container_width=True, hide_index=True)
-        keep_row = comparison_table.iloc[0]
-        remove_row = comparison_table.iloc[1]
-        r2_better = "Keep Outliers" if keep_row["R² Test"] >= remove_row["R² Test"] else "Remove Outliers"
-        mae_better = "Keep Outliers" if keep_row["MAE Test"] <= remove_row["MAE Test"] else "Remove Outliers"
-        rmse_better = "Keep Outliers" if keep_row["RMSE Test"] <= remove_row["RMSE Test"] else "Remove Outliers"
-        mape_better = "Keep Outliers" if keep_row["MAPE Test"] <= remove_row["MAPE Test"] else "Remove Outliers"
-        st.markdown(
-            f"<div class='soft-chip'>Test R² terbaik: <b>{r2_better}</b></div> &nbsp; "
-            f"<div class='soft-chip'>MAE terbaik: <b>{mae_better}</b></div> &nbsp; "
-            f"<div class='soft-chip'>RMSE terbaik: <b>{rmse_better}</b></div> &nbsp; "
-            f"<div class='soft-chip'>MAPE terbaik: <b>{mape_better}</b></div>",
-            unsafe_allow_html=True,
-        )
-        st.caption("Perbandingan dinilai dari data test. Remove Outliers tidak otomatis lebih baik; gunakan performa test dan konteks analisis untuk menentukan model final.")
-    else:
-        st.caption("Aktifkan 'Compare Both Models' di sidebar untuk membandingkan Keep Outliers dan Remove Outliers.")
     st.markdown('</div>', unsafe_allow_html=True)
 
     a, b = st.columns([1.15, .85])
@@ -1483,7 +1507,7 @@ if page == "Dashboard":
         st.markdown('<div class="card" style="margin-top:16px">', unsafe_allow_html=True)
         section_head("Dataset", "Seluruh observasi dapat discroll; tidak dibatasi 100 baris")
         st.dataframe(style_table(df_raw.rename(columns=DISPLAY_LABELS)), use_container_width=True, hide_index=True, height=620)
-        xlsx_data=build_full_analysis_xlsx(df_raw,df_model,FINAL_FEATURES,final_metrics_train,final_metrics_test,final_coef_df,final_y_test,final_y_pred_test,extreme_summary,comparison_table)
+        xlsx_data=build_full_analysis_xlsx(df_raw,df_model,FINAL_FEATURES,final_metrics_train,final_metrics_test,final_coef_df,final_y_test,final_y_pred_test,extreme_summary,None)
         export_spacer, export_col = st.columns([5.5, 1.5])
         with export_col:
             st.download_button("Export Hasil Analisis ↓",xlsx_data,"Toyota_Corolla_Full_Analysis.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True,key="dashboard_full_analysis_export")
