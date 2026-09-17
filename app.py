@@ -1158,6 +1158,7 @@ def render_predict_price():
 
     st.markdown('<div class="card prediction-criteria-card">', unsafe_allow_html=True)
     section_head("Your criteria", "Atur nilai setiap variabel sesuai kendaraan yang ingin diprediksi")
+    st.caption("Jenis bahan bakar mengikuti seluruh kategori yang tersedia pada dataset: CNG, Diesel, dan Petrol.")
 
     scoped = df_raw.copy()
     if selected_pred_model and "Model" in scoped.columns:
@@ -1184,7 +1185,13 @@ def render_predict_price():
                 s = scoped[feat]
                 with col_ui:
                     if feat in {"Automatic", "Metallic", "Doors", "Fuel Type"}:
-                        options = categorical_display_options(feat, s.dropna().unique().tolist())
+                        # Fuel Type harus selalu menampilkan seluruh kategori yang memang
+                        # ada di dataset (termasuk CNG), walaupun tipe model yang dipilih
+                        # kebetulan tidak memiliki observasi CNG.
+                        option_source = s.dropna().unique().tolist()
+                        if feat == "Fuel Type":
+                            option_source = df_raw[feat].dropna().unique().tolist()
+                        options = categorical_display_options(feat, option_source)
                         labels = [x[0] for x in options]
                         chosen = st.radio(
                             display_name(feat), labels, horizontal=True,
@@ -1220,7 +1227,7 @@ def render_predict_price():
         submit = st.form_submit_button("Hitung Estimasi Harga  →", use_container_width=True)
 
     st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown('<div class="prediction-note">Semua 10 predictor model sekarang aktif di panel ini, termasuk <b>Pajak Tahunan</b> dan <b>Bobot Kendaraan</b>. Slider numerik menggunakan nilai tengah dari rentang yang kamu pilih; variabel kategorikal dipilih langsung seperti pada Find a Car.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="prediction-note">Semua 10 predictor model aktif di panel ini. Slider numerik mengikuti pola <b>Your criteria</b> pada Find a Car, sedangkan variabel kategorikal dipilih langsung. Nilai tengah rentang numerik digunakan sebagai input prediksi.</div>', unsafe_allow_html=True)
 
     if submit:
         inp = pd.DataFrame([vals])
@@ -1233,6 +1240,62 @@ def render_predict_price():
             f'<div class="result-meta">Approximate model error band: €{lo:,.0f} — €{hi:,.0f}</div></div>',
             unsafe_allow_html=True,
         )
+
+        # Cari kendaraan yang benar-benar memenuhi kriteria yang baru dipilih.
+        # Model type mengikuti simplified model, numerik mengikuti rentang slider,
+        # dan kategorikal harus sama persis dengan pilihan pengguna.
+        matching = df_raw.copy()
+        if selected_pred_model and "Model" in matching.columns:
+            matching = matching[matching["Model"].map(simplify_model_name) == selected_pred_model]
+
+        # Simpan rentang numerik dari widget untuk digunakan lagi pada matching.
+        numeric_ranges = {}
+        for feat in FINAL_FEATURES:
+            if feat in {"Automatic", "Metallic", "Doors", "Fuel Type"}:
+                continue
+            key = f"pred_criteria_{feat}_range"
+            if key in st.session_state:
+                numeric_ranges[feat] = st.session_state[key]
+
+        for feat, (left, right) in numeric_ranges.items():
+            if feat in matching.columns:
+                vals_series = pd.to_numeric(matching[feat], errors="coerce")
+                matching = matching[vals_series.between(left, right, inclusive="both")]
+
+        for feat in {"Automatic", "Metallic", "Doors", "Fuel Type"}.intersection(FINAL_FEATURES):
+            if feat in vals and feat in matching.columns:
+                try:
+                    matching = matching[matching[feat] == vals[feat]]
+                except Exception:
+                    pass
+
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        section_head("Matching Cars", "Kendaraan yang memenuhi seluruh kriteria yang dipilih pada panel prediksi")
+
+        if matching.empty:
+            st.info("Belum ada kendaraan yang benar-benar cocok dengan kombinasi kriteria ini. Coba lebarkan salah satu rentang numerik atau ubah pilihan kategorikal.")
+        else:
+            # Statistik hanya dihitung dari mobil yang match, bukan seluruh dataset.
+            median_actual = float(pd.to_numeric(matching["Price"], errors="coerce").median())
+            try:
+                # Prediksi seluruh mobil yang match untuk mendapatkan harga tipikal model.
+                X_match = transform_new_data(matching[FINAL_FEATURES], final_transformer)
+                X_match = X_match.reindex(columns=final_feature_names, fill_value=0.0)
+                pred_match = np.asarray(final_model.predict(sm.add_constant(X_match, has_constant="add")), dtype=float)
+                typical_pred = float(np.median(pred_match))
+            except Exception:
+                typical_pred = float(pred)
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Mobil cocok", f"{len(matching):,}")
+            m2.metric("Median harga aktual", f"€{median_actual:,.0f}")
+            m3.metric("Harga tipikal model", f"€{typical_pred:,.0f}")
+
+            show_cols = [c for c in ["Model", "Price"] + ANALYSIS_FEATURES if c in matching.columns and c != "Id"]
+            display_matching = matching[show_cols].rename(columns=DISPLAY_LABELS).copy()
+            st.dataframe(style_table(display_matching), use_container_width=True, hide_index=True, height=420)
+
+        st.markdown('</div>', unsafe_allow_html=True)
 
 
 def render_model_evaluation():
@@ -1575,12 +1638,8 @@ if page == "Dashboard":
 # PAGE DISPATCH
 # ─────────────────────────────────────────────────────────────────────────────
 elif page == "Find & Predict Car Price":
-    st.markdown('<div class="eyebrow">Buyer workspace</div><div class="page-title">Find a car, then estimate its price.</div><div class="page-copy">Satu workspace untuk mencari kendaraan berdasarkan kriteria dan memprediksi harga Corolla bekas.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="eyebrow">Buyer workspace</div><div class="page-title">Find & Predict Car Price</div><div class="page-copy">Satu workspace untuk memilih spesifikasi kendaraan, mengestimasi harga, dan melihat kendaraan yang benar-benar match dengan kriteria tersebut.</div>', unsafe_allow_html=True)
     st.markdown('<div class="rule"></div>', unsafe_allow_html=True)
-    tab_find, tab_predict = st.tabs(["Find a Car", "Predict Price"])
-    with tab_find:
-        render_find_car()
-    with tab_predict:
-        render_predict_price()
+    render_predict_price()
 
 st.markdown('<div style="text-align:center;color:#9a9a94;font-size:10px;margin-top:45px;letter-spacing:.04em">PRICE ANALYTICS · MULTIPLE LINEAR REGRESSION</div>', unsafe_allow_html=True)
